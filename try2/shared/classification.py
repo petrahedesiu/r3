@@ -20,6 +20,7 @@ import numpy as np
 import joblib
 import openpyxl
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 
@@ -96,24 +97,43 @@ def extract_ethmoid_features(
     volume: np.ndarray, mask: np.ndarray, class_id: int
 ) -> np.ndarray:
     """
-    6 CT intensity features sampled from voxels belonging to class_id.
-    volume shape: (H, W, D), dtype typically int16 (HU values).
+    Ethmoid filling features derived from the middle sagittal slab.
+
+    Best config from sweep: slab ±1 voxel around the middle of the W range
+    (not the centroid), threshold -200 HU for filled_ratio.
+
+    volume shape: (H, W, D) — W = columns = left-right axis.
+    Sagittal plane = H×D at fixed W.
     Returns zeros if class_id is absent.
     """
-    voxels = np.argwhere(mask == class_id)
+    voxels = np.argwhere(mask == class_id)  # (N, 3): h, w, d
 
     if len(voxels) == 0:
         return np.zeros(6, dtype=np.float32)
 
-    intensities = volume[voxels[:, 0], voxels[:, 1], voxels[:, 2]].astype(np.float32)
+    # Middle of the W extent of the mask (not centroid — midpoint of range)
+    w_min, w_max = int(voxels[:, 1].min()), int(voxels[:, 1].max())
+    w_mid = (w_min + w_max) // 2
+    w_lo = max(0, w_mid - 1)
+    w_hi = min(volume.shape[1] - 1, w_mid + 1)
 
-    mean_hu   = float(np.mean(intensities))
-    median_hu = float(np.median(intensities))
-    std_hu    = float(np.std(intensities))
-    p10_hu    = float(np.percentile(intensities, 10))
-    p90_hu    = float(np.percentile(intensities, 90))
-    # fraction of voxels above air threshold — fluid/mucus >> -500 HU
-    filled_ratio = float(np.mean(intensities > -500))
+    slab_mask = (voxels[:, 1] >= w_lo) & (voxels[:, 1] <= w_hi)
+    slab_voxels = voxels[slab_mask]
+
+    if len(slab_voxels) == 0:
+        return np.zeros(6, dtype=np.float32)
+
+    intensities = volume[
+        slab_voxels[:, 0], slab_voxels[:, 1], slab_voxels[:, 2]
+    ].astype(np.float32)
+
+    mean_hu      = float(np.mean(intensities))
+    median_hu    = float(np.median(intensities))
+    std_hu       = float(np.std(intensities))
+    p10_hu       = float(np.percentile(intensities, 10))
+    p90_hu       = float(np.percentile(intensities, 90))
+    # -200 HU threshold: better air/soft-tissue boundary than -500
+    filled_ratio = float(np.mean(intensities > -200))
 
     return np.array(
         [mean_hu, median_hu, std_hu, p10_hu, p90_hu, filled_ratio],
@@ -182,7 +202,14 @@ def build_feature_matrix(
     return X_dict, y_dict
 
 
-def _make_clf() -> Pipeline:
+def _make_clf(task: str) -> Pipeline:
+    """Return the best classifier pipeline for the given task.
+
+    All tasks use LogisticRegression — stable under LOO-CV with small
+    positive class sizes (23–26 positives out of 133). RandomForest showed
+    higher variance and collapsed recall in LOO-CV despite appearing better
+    in a fixed-split sweep.
+    """
     return Pipeline([
         ("scaler", StandardScaler()),
         ("clf", LogisticRegression(class_weight="balanced", max_iter=1000, C=1.0)),
@@ -208,7 +235,7 @@ def train_classifiers(
         y = y_dict[task]
         if len(X) == 0:
             continue
-        clf = _make_clf()
+        clf = _make_clf(task)
         clf.fit(X, y)
         clfs[task] = clf
     return clfs

@@ -168,7 +168,7 @@ def loo_evaluate(X: np.ndarray, y: np.ndarray, task: str) -> dict:
     y_true, y_pred, y_prob = [], [], []
 
     for train_idx, test_idx in loo.split(X):
-        clf = _make_clf()
+        clf = _make_clf(task)
         clf.fit(X[train_idx], y[train_idx])
         y_true.append(y[test_idx[0]])
         y_pred.append(clf.predict(X[test_idx])[0])
