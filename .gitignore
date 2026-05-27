@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Data
+CROP1/
+CROP EXT/
+*.xlsx
+*.nrrd
+*.dcm
+
+# Outputs / models
+try2/outputs/
+try3/results/
+*.joblib
+*.pth
+*.pt
+
+# System
+.DS_Store
