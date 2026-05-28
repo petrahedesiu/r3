@@ -46,6 +46,7 @@ from shared.classification import (
     predict_classifications,
     TASK_TO_FEATURES,
     _make_clf,
+    extract_features,
 )
 from shared.config import ExperimentConfig
 
@@ -159,20 +160,27 @@ def load_ext_data(ext_dir: str):
 # LOO cross-validation
 # ---------------------------------------------------------------------------
 
-def loo_evaluate(X: np.ndarray, y: np.ndarray, task: str) -> dict:
-    if len(X) < 4:
-        print(f"  [skip] {task}: only {len(X)} samples with matched labels")
+def loo_evaluate(
+    X: np.ndarray, y: np.ndarray, patient_idx: np.ndarray, task: str
+) -> dict:
+    """Patient-level LOO-CV: hold out both sides of one patient per fold."""
+    patients = np.unique(patient_idx)
+    if len(patients) < 4:
+        print(f"  [skip] {task}: only {len(patients)} patients with matched labels")
         return {}
 
-    loo = LeaveOneOut()
     y_true, y_pred, y_prob = [], [], []
 
-    for train_idx, test_idx in loo.split(X):
+    for p in patients:
+        test_mask  = patient_idx == p
+        train_mask = ~test_mask
         clf = _make_clf(task)
-        clf.fit(X[train_idx], y[train_idx])
-        y_true.append(y[test_idx[0]])
-        y_pred.append(clf.predict(X[test_idx])[0])
-        y_prob.append(clf.predict_proba(X[test_idx])[0, 1])
+        clf.fit(X[train_mask], y[train_mask])
+        probs = clf.predict_proba(X[test_mask])[:, 1]
+        preds = clf.predict(X[test_mask])
+        y_true.extend(y[test_mask].tolist())
+        y_pred.extend(preds.tolist())
+        y_prob.extend(probs.tolist())
 
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
@@ -209,23 +217,28 @@ def run_ext_validation(
         print("No EXT patients loaded — check ext_dir structure.")
         return
 
-    # Run predictions
+    # Run predictions — each patient produces left + right rows
+    side_labels = {
+        "left":  ("aeal_roof_contact", "left_ethmoid_filled"),
+        "right": ("aear_roof_contact", "right_ethmoid_filled"),
+    }
     rows = []
     for code, vol, msk in zip(codes, volumes, masks):
         preds = predict_classifications(vol, msk, clfs)
-        row = {"patient_code": code}
-        row.update(preds)
-        # Attach ground-truth labels if available in Excel
-        if code in labels:
-            for task in TASK_TO_FEATURES:
-                row[f"{task}_gt"] = labels[code][task]
-        rows.append(row)
+        for side, (roof_lbl, eth_lbl) in side_labels.items():
+            row = {"patient_code": code, "side": side}
+            row["roof_contact"]   = preds[side].get("roof_contact", "")
+            row["ethmoid_filled"] = preds[side].get("ethmoid_filled", "")
+            if code in labels:
+                row["roof_contact_gt"]   = labels[code][roof_lbl]
+                row["ethmoid_filled_gt"] = labels[code][eth_lbl]
+            rows.append(row)
 
     # Save predictions CSV
     os.makedirs(output_dir, exist_ok=True)
     csv_path = os.path.join(output_dir, "ext_predictions.csv")
-    fieldnames = ["patient_code"] + list(TASK_TO_FEATURES.keys()) + \
-                 [f"{t}_gt" for t in TASK_TO_FEATURES]
+    fieldnames = ["patient_code", "side", "roof_contact", "ethmoid_filled",
+                  "roof_contact_gt", "ethmoid_filled_gt"]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
@@ -233,13 +246,13 @@ def run_ext_validation(
     print(f"Predictions saved → {csv_path}")
 
     # Compute metrics for patients that have Excel labels
-    labeled_rows = [r for r in rows if f"{list(TASK_TO_FEATURES)[0]}_gt" in r]
+    labeled_rows = [r for r in rows if "roof_contact_gt" in r]
     if not labeled_rows:
         print("No EXT patients found in Excel — predictions saved, no metrics computed.")
         return
 
-    print(f"\nMetrics on {len(labeled_rows)} EXT patients with Excel labels:")
-    for task in TASK_TO_FEATURES:
+    print(f"\nMetrics on {len(labeled_rows)} EXT instances with Excel labels:")
+    for task in ("roof_contact", "ethmoid_filled"):
         y_true = np.array([r[f"{task}_gt"] for r in labeled_rows])
         y_pred = np.array([r[task] for r in labeled_rows])
         if len(np.unique(y_true)) < 2:
@@ -293,13 +306,14 @@ def main():
         print("\nERROR: No patients matched. Check patient code extraction.")
         return
 
-    X_dict, y_dict = build_feature_matrix(codes, volumes, masks, labels)
-    n = len(y_dict["aeal_roof_contact"])
-    print(f"\nFeature matrix built: {n} patients with matched labels")
+    X_dict, y_dict, patient_idx = build_feature_matrix(codes, volumes, masks, labels)
+    n_patients = len(np.unique(patient_idx))
+    n_samples  = len(y_dict["roof_contact"])
+    print(f"\nFeature matrix built: {n_patients} patients → {n_samples} samples (L+R pooled)")
 
-    # LOO cross-validation
+    # LOO cross-validation (patient-level)
     print(f"\n{'=' * 60}")
-    print("Leave-One-Out Cross-Validation (CROP1)")
+    print("Patient-level Leave-One-Out Cross-Validation (CROP1)")
     print(f"{'=' * 60}")
 
     for task, feat_key in TASK_TO_FEATURES.items():
@@ -308,7 +322,7 @@ def main():
         print(f"\n--- {task} ---")
         print(f"  Features : {feat_key}  shape={X.shape}")
         print(f"  Positive : {int(y.sum())}/{len(y)} ({100*y.mean():.1f}%)")
-        res = loo_evaluate(X, y, task)
+        res = loo_evaluate(X, y, patient_idx, task)
         if res:
             print(f"  Accuracy          : {res['accuracy']:.3f}")
             print(f"  Balanced accuracy : {res['balanced_accuracy']:.3f}")

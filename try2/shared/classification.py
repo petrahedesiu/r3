@@ -2,15 +2,13 @@
 Post-hoc classification of AEA segmentation masks.
 
 Given a 3D volume (H×W×D) and a 3-class segmentation mask (BG=0, AEAL=1, AEAR=2),
-predicts 4 binary labels per patient:
+predicts 2 binary labels per AEA instance (side-agnostic):
 
-  Roof contact (geometric — mask z-position only):
-    aeal_roof_contact  : AEAL in contact with skull roof (1) vs distant (0)
-    aear_roof_contact  : AEAR in contact with skull roof (1) vs distant (0)
+  roof_contact   : AEA in contact with skull roof (1) vs distant (0)
+  ethmoid_filled : ethmoid sinus adjacent to AEA is filled/sinusitis (1) vs clear (0)
 
-  Ethmoid sinus status (radiological — CT intensity in mask region):
-    left_ethmoid_filled  : left ethmoid filled/sinusitis (1) vs clear (0)
-    right_ethmoid_filled : right ethmoid filled/sinusitis (1) vs clear (0)
+Each patient contributes 2 samples (left + right), pooled into a single classifier
+per task. LOO-CV is patient-level: both sides of a patient are held out together.
 """
 
 import os
@@ -26,7 +24,13 @@ from sklearn.pipeline import Pipeline
 
 
 def load_classification_labels(xlsx_path: str) -> Dict[str, Dict[str, int]]:
-    """Return dict keyed by patient_code with 4 binary label values."""
+    """Return dict keyed by patient_code.
+
+    Each entry has per-side labels (still stored separately so we can pool
+    them into side-agnostic samples in build_feature_matrix):
+      aeal_roof_contact, aear_roof_contact,
+      left_ethmoid_filled, right_ethmoid_filled
+    """
     wb = openpyxl.load_workbook(xlsx_path)
     ws = wb.active
     labels: Dict[str, Dict[str, int]] = {}
@@ -159,47 +163,48 @@ def build_feature_matrix(
     volumes: List[np.ndarray],
     masks: List[np.ndarray],
     labels: Dict[str, Dict[str, int]],
-) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], np.ndarray]:
     """
-    Returns:
-      X_dict — {"roof_L": (N,4), "roof_R": (N,4), "ethmoid_L": (N,6), "ethmoid_R": (N,6)}
-      y_dict — {"aeal_roof_contact": (N,), "aear_roof_contact": (N,),
-                "left_ethmoid_filled": (N,), "right_ethmoid_filled": (N,)}
-    Only patients whose code appears in `labels` are included; returns their
-    filtered indices as well.
-    """
-    feat_roof_L, feat_roof_R = [], []
-    feat_eth_L, feat_eth_R   = [], []
-    y_aeal_roof, y_aear_roof = [], []
-    y_left_eth,  y_right_eth = [], []
+    Pool left and right sides into side-agnostic feature matrices.
 
-    for code, vol, msk in zip(patient_codes, volumes, masks):
+    Each patient contributes 2 rows (left side first, then right side).
+    Returns:
+      X_dict       — {"roof": (2N, 6), "ethmoid": (2N, 6)}
+      y_dict       — {"roof_contact": (2N,), "ethmoid_filled": (2N,)}
+      patient_idx  — (2N,) integer array mapping each row to its patient index.
+                     Used for patient-level LOO-CV (hold out both sides together).
+    """
+    feat_roof, feat_eth = [], []
+    y_roof, y_eth       = [], []
+    patient_idx         = []
+
+    for p_idx, (code, vol, msk) in enumerate(zip(patient_codes, volumes, masks)):
         if code not in labels:
             continue
         feats = extract_features(vol, msk)
-        feat_roof_L.append(feats["roof_L"])
-        feat_roof_R.append(feats["roof_R"])
-        feat_eth_L.append(feats["ethmoid_L"])
-        feat_eth_R.append(feats["ethmoid_R"])
-        lbl = labels[code]
-        y_aeal_roof.append(lbl["aeal_roof_contact"])
-        y_aear_roof.append(lbl["aear_roof_contact"])
-        y_left_eth.append(lbl["left_ethmoid_filled"])
-        y_right_eth.append(lbl["right_ethmoid_filled"])
+        lbl   = labels[code]
+        # Left side (class_id=1)
+        feat_roof.append(feats["roof_L"])
+        feat_eth.append(feats["ethmoid_L"])
+        y_roof.append(lbl["aeal_roof_contact"])
+        y_eth.append(lbl["left_ethmoid_filled"])
+        patient_idx.append(p_idx)
+        # Right side (class_id=2)
+        feat_roof.append(feats["roof_R"])
+        feat_eth.append(feats["ethmoid_R"])
+        y_roof.append(lbl["aear_roof_contact"])
+        y_eth.append(lbl["right_ethmoid_filled"])
+        patient_idx.append(p_idx)
 
     X_dict = {
-        "roof_L":    np.stack(feat_roof_L) if feat_roof_L else np.empty((0, 6)),
-        "roof_R":    np.stack(feat_roof_R) if feat_roof_R else np.empty((0, 6)),
-        "ethmoid_L": np.stack(feat_eth_L)  if feat_eth_L  else np.empty((0, 6)),
-        "ethmoid_R": np.stack(feat_eth_R)  if feat_eth_R  else np.empty((0, 6)),
+        "roof":    np.stack(feat_roof) if feat_roof else np.empty((0, 6)),
+        "ethmoid": np.stack(feat_eth)  if feat_eth  else np.empty((0, 6)),
     }
     y_dict = {
-        "aeal_roof_contact":   np.array(y_aeal_roof,  dtype=np.int32),
-        "aear_roof_contact":   np.array(y_aear_roof,  dtype=np.int32),
-        "left_ethmoid_filled": np.array(y_left_eth,   dtype=np.int32),
-        "right_ethmoid_filled": np.array(y_right_eth, dtype=np.int32),
+        "roof_contact":   np.array(y_roof, dtype=np.int32),
+        "ethmoid_filled": np.array(y_eth,  dtype=np.int32),
     }
-    return X_dict, y_dict
+    return X_dict, y_dict, np.array(patient_idx, dtype=np.int32)
 
 
 def _make_clf(task: str) -> Pipeline:
@@ -217,10 +222,8 @@ def _make_clf(task: str) -> Pipeline:
 
 
 TASK_TO_FEATURES = {
-    "aeal_roof_contact":    "roof_L",
-    "aear_roof_contact":    "roof_R",
-    "left_ethmoid_filled":  "ethmoid_L",
-    "right_ethmoid_filled": "ethmoid_R",
+    "roof_contact":   "roof",
+    "ethmoid_filled": "ethmoid",
 }
 
 
@@ -260,18 +263,26 @@ def predict_classifications(
     volume: np.ndarray,
     mask: np.ndarray,
     clfs: Dict[str, Pipeline],
-) -> Dict[str, int]:
+) -> Dict[str, Dict[str, int]]:
     """
-    Given a single patient's volume and predicted mask, return classification
-    predictions as a dict of {task_name: 0_or_1}.
+    Given a single patient's volume and mask, return side-agnostic predictions.
+
+    Returns: {"left": {"roof_contact": 0/1, "ethmoid_filled": 0/1},
+              "right": {"roof_contact": 0/1, "ethmoid_filled": 0/1}}
     """
     feats = extract_features(volume, mask)
-    results: Dict[str, int] = {}
-    for task, feat_key in TASK_TO_FEATURES.items():
-        if task not in clfs:
-            continue
-        x = feats[feat_key].reshape(1, -1)
-        results[task] = int(clfs[task].predict(x)[0])
+    side_feat = {"left": ("roof_L", "ethmoid_L"), "right": ("roof_R", "ethmoid_R")}
+    results: Dict[str, Dict[str, int]] = {}
+    for side, (rf_key, eth_key) in side_feat.items():
+        results[side] = {}
+        if "roof_contact" in clfs:
+            results[side]["roof_contact"] = int(
+                clfs["roof_contact"].predict(feats[rf_key].reshape(1, -1))[0]
+            )
+        if "ethmoid_filled" in clfs:
+            results[side]["ethmoid_filled"] = int(
+                clfs["ethmoid_filled"].predict(feats[eth_key].reshape(1, -1))[0]
+            )
     return results
 
 
@@ -279,13 +290,19 @@ def predict_classifications_proba(
     volume: np.ndarray,
     mask: np.ndarray,
     clfs: Dict[str, Pipeline],
-) -> Dict[str, float]:
+) -> Dict[str, Dict[str, float]]:
     """Same as predict_classifications but returns probability of positive class."""
     feats = extract_features(volume, mask)
-    results: Dict[str, float] = {}
-    for task, feat_key in TASK_TO_FEATURES.items():
-        if task not in clfs:
-            continue
-        x = feats[feat_key].reshape(1, -1)
-        results[task] = float(clfs[task].predict_proba(x)[0, 1])
+    side_feat = {"left": ("roof_L", "ethmoid_L"), "right": ("roof_R", "ethmoid_R")}
+    results: Dict[str, Dict[str, float]] = {}
+    for side, (rf_key, eth_key) in side_feat.items():
+        results[side] = {}
+        if "roof_contact" in clfs:
+            results[side]["roof_contact"] = float(
+                clfs["roof_contact"].predict_proba(feats[rf_key].reshape(1, -1))[0, 1]
+            )
+        if "ethmoid_filled" in clfs:
+            results[side]["ethmoid_filled"] = float(
+                clfs["ethmoid_filled"].predict_proba(feats[eth_key].reshape(1, -1))[0, 1]
+            )
     return results
